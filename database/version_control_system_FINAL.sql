@@ -884,3 +884,587 @@ SELECT
     MAX(committed_at) AS latest_commit_time
 FROM `COMMIT`;
 
+-- ================================================================
+-- 11. ORDER BY
+-- ================================================================
+
+-- Branches ordered by number of commits.
+SELECT
+    b.branch_id,
+    b.branch_name,
+    r.repo_name,
+    COUNT(c.commit_id) AS commit_count
+FROM `BRANCH` b
+JOIN `REPOSITORY` r ON r.repo_id = b.repo_id
+LEFT JOIN `COMMIT` c ON c.branch_id = b.branch_id
+GROUP BY b.branch_id, b.branch_name, r.repo_name
+ORDER BY commit_count DESC, r.repo_name, b.branch_name;
+
+-- ================================================================
+-- 12. SUBQUERIES
+-- ================================================================
+
+-- 12.1 Repositories having more commits than the average repository.
+SELECT
+    r.repo_id,
+    r.repo_name
+FROM `REPOSITORY` r
+WHERE (
+    SELECT COUNT(*)
+    FROM `COMMIT` c
+    JOIN `BRANCH` b2 ON b2.branch_id = c.branch_id
+    WHERE b2.repo_id = r.repo_id
+) > (
+    SELECT AVG(repo_commit_count)
+    FROM (
+        SELECT
+            r2.repo_id,
+            COUNT(c2.commit_id) AS repo_commit_count
+        FROM `REPOSITORY` r2
+        LEFT JOIN `BRANCH` b3 ON b3.repo_id = r2.repo_id
+        LEFT JOIN `COMMIT` c2 ON c2.branch_id = b3.branch_id
+        GROUP BY r2.repo_id
+    ) AS avg_repo_commits
+)
+ORDER BY r.repo_name;
+
+-- 12.2 Users who have made more pushes than the average push count.
+SELECT
+    u.user_id,
+    u.username
+FROM `USER` u
+WHERE (
+    SELECT COUNT(*)
+    FROM `PUSH_EVENT` p
+    WHERE p.user_id = u.user_id
+) > (
+    SELECT AVG(user_push_count)
+    FROM (
+        SELECT
+            u2.user_id,
+            COUNT(p2.push_id) AS user_push_count
+        FROM `USER` u2
+        LEFT JOIN `PUSH_EVENT` p2 ON p2.user_id = u2.user_id
+        GROUP BY u2.user_id
+    ) AS avg_user_pushes
+)
+ORDER BY u.username;
+
+-- 12.3 Find the repositories owned by the user(s) with the most repositories.
+SELECT
+    r.repo_id,
+    r.repo_name,
+    r.owner_user_id
+FROM `REPOSITORY` r
+WHERE r.owner_user_id IN (
+    SELECT owner_counts.user_id
+    FROM (
+        SELECT owner_user_id AS user_id, COUNT(*) AS repository_count
+        FROM `REPOSITORY`
+        GROUP BY owner_user_id
+    ) AS owner_counts
+    WHERE owner_counts.repository_count = (
+        SELECT MAX(x.repository_count)
+        FROM (
+            SELECT owner_user_id, COUNT(*) AS repository_count
+            FROM `REPOSITORY`
+            GROUP BY owner_user_id
+        ) AS x
+    )
+)
+ORDER BY r.repo_name;
+
+-- ================================================================
+-- 13. COMPLEX QUERY
+-- ================================================================
+
+-- Repository activity dashboard:
+-- owner, members, branches, commits and latest commit time.
+SELECT
+    r.repo_id,
+    r.repo_name,
+    u.username AS owner,
+    COUNT(DISTINCT rm.membership_id) AS member_count,
+    COUNT(DISTINCT b.branch_id) AS branch_count,
+    COUNT(DISTINCT c.commit_id) AS commit_count,
+    MAX(c.committed_at) AS latest_commit
+FROM `REPOSITORY` r
+JOIN `USER` u ON u.user_id = r.owner_user_id
+LEFT JOIN `REPOSITORY_MEMBER` rm ON rm.repo_id = r.repo_id
+LEFT JOIN `BRANCH` b ON b.repo_id = r.repo_id
+LEFT JOIN `COMMIT` c ON c.branch_id = b.branch_id
+GROUP BY r.repo_id, r.repo_name, u.username
+HAVING COUNT(DISTINCT c.commit_id) >= 2
+ORDER BY commit_count DESC, r.repo_name;
+
+-- ================================================================
+-- 14. VIEW
+-- ================================================================
+
+CREATE VIEW `vw_repository_activity` AS
+SELECT
+    r.repo_id,
+    r.repo_name,
+    u.username AS owner,
+    r.visibility,
+    COUNT(DISTINCT rm.membership_id) AS member_count,
+    COUNT(DISTINCT b.branch_id) AS branch_count,
+    COUNT(DISTINCT c.commit_id) AS commit_count,
+    MAX(c.committed_at) AS latest_commit
+FROM `REPOSITORY` r
+JOIN `USER` u ON u.user_id = r.owner_user_id
+LEFT JOIN `REPOSITORY_MEMBER` rm ON rm.repo_id = r.repo_id
+LEFT JOIN `BRANCH` b ON b.repo_id = r.repo_id
+LEFT JOIN `COMMIT` c ON c.branch_id = b.branch_id
+GROUP BY r.repo_id, r.repo_name, u.username, r.visibility;
+
+-- View execution.
+SELECT *
+FROM `vw_repository_activity`
+ORDER BY commit_count DESC, repo_name;
+
+-- ================================================================
+-- 15. TRANSACTION WITH COMMIT
+-- ================================================================
+
+-- Demonstrate a successful branch + commit + push workflow.
+START TRANSACTION;
+
+INSERT INTO `BRANCH`
+    (branch_name, repo_id, created_by_user_id)
+VALUES
+    ('transaction-demo', 1, 1);
+
+SET @transaction_branch_id = LAST_INSERT_ID();
+
+INSERT INTO `COMMIT`
+    (message, branch_id, author_user_id, tree_id)
+VALUES
+    ('Transaction demonstration commit', @transaction_branch_id, 1, 10);
+
+SET @transaction_commit_id = LAST_INSERT_ID();
+
+INSERT INTO `PUSH_EVENT`
+    (user_id, branch_id)
+VALUES
+    (1, @transaction_branch_id);
+
+COMMIT;
+
+-- Verify that the committed transaction is persistent.
+SELECT
+    b.branch_id,
+    b.branch_name,
+    c.commit_id,
+    c.message,
+    p.push_id
+FROM `BRANCH` b
+LEFT JOIN `COMMIT` c ON c.branch_id = b.branch_id
+LEFT JOIN `PUSH_EVENT` p ON p.branch_id = b.branch_id
+WHERE b.branch_id = @transaction_branch_id;
+
+-- ================================================================
+-- 16. TRANSACTION WITH ROLLBACK
+-- ================================================================
+
+-- Demonstrate that a branch/commit/push sequence can be completely undone.
+START TRANSACTION;
+
+INSERT INTO `BRANCH`
+    (branch_name, repo_id, created_by_user_id)
+VALUES
+    ('rollback-demo', 1, 1);
+
+SET @rollback_branch_id = LAST_INSERT_ID();
+
+INSERT INTO `COMMIT`
+    (message, branch_id, author_user_id, tree_id)
+VALUES
+    ('Temporary commit that will be rolled back', @rollback_branch_id, 1, 10);
+
+INSERT INTO `PUSH_EVENT`
+    (user_id, branch_id)
+VALUES
+    (1, @rollback_branch_id);
+
+-- Shows the records while the transaction is still active.
+SELECT
+    b.branch_id,
+    b.branch_name,
+    c.commit_id,
+    p.push_id
+FROM `BRANCH` b
+LEFT JOIN `COMMIT` c ON c.branch_id = b.branch_id
+LEFT JOIN `PUSH_EVENT` p ON p.branch_id = b.branch_id
+WHERE b.branch_id = @rollback_branch_id;
+
+ROLLBACK;
+
+-- After ROLLBACK the temporary branch and its dependent rows are gone.
+SELECT COUNT(*) AS rollback_branch_count
+FROM `BRANCH`
+WHERE branch_id = @rollback_branch_id;
+
+-- ================================================================
+-- 17. STORED FUNCTIONS
+-- ================================================================
+
+DELIMITER $$
+
+CREATE FUNCTION fn_repo_commit_count(p_repo_id INT)
+RETURNS INT
+DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_commit_count INT DEFAULT 0;
+
+    SELECT COUNT(c.commit_id)
+      INTO v_commit_count
+      FROM `COMMIT` c
+      JOIN `BRANCH` b ON b.branch_id = c.branch_id
+     WHERE b.repo_id = p_repo_id;
+
+    RETURN v_commit_count;
+END$$
+
+CREATE FUNCTION fn_branch_commit_count(p_branch_id INT)
+RETURNS INT
+DETERMINISTIC
+READS SQL DATA
+BEGIN
+    DECLARE v_commit_count INT DEFAULT 0;
+
+    SELECT COUNT(*)
+      INTO v_commit_count
+      FROM `COMMIT`
+     WHERE branch_id = p_branch_id;
+
+    RETURN v_commit_count;
+END$$
+
+DELIMITER ;
+
+-- Function execution.
+SELECT
+    repo_id,
+    repo_name,
+    fn_repo_commit_count(repo_id) AS commit_count
+FROM `REPOSITORY`
+ORDER BY commit_count DESC, repo_name;
+
+SELECT
+    branch_id,
+    branch_name,
+    fn_branch_commit_count(branch_id) AS commit_count
+FROM `BRANCH`
+ORDER BY commit_count DESC, branch_id;
+
+-- ================================================================
+-- 18. STORED PROCEDURES
+-- ================================================================
+
+DELIMITER $$
+
+-- Create a repository and return its generated ID.
+CREATE PROCEDURE sp_create_repository(
+    IN p_owner_user_id INT,
+    IN p_repo_name VARCHAR(100),
+    IN p_description TEXT,
+    IN p_visibility VARCHAR(20),
+    OUT p_repo_id INT
+)
+BEGIN
+    DECLARE v_user_count INT DEFAULT 0;
+
+    SELECT COUNT(*)
+      INTO v_user_count
+      FROM `USER`
+     WHERE user_id = p_owner_user_id;
+
+    IF v_user_count = 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Repository owner does not exist';
+    END IF;
+
+    INSERT INTO `REPOSITORY`
+        (repo_name, description, visibility, owner_user_id)
+    VALUES
+        (p_repo_name, p_description, p_visibility, p_owner_user_id);
+
+    SET p_repo_id = LAST_INSERT_ID();
+END$$
+
+-- Create a branch through the stored procedure.
+CREATE PROCEDURE sp_create_branch(
+    IN p_repo_id INT,
+    IN p_branch_name VARCHAR(100),
+    IN p_created_by_user_id INT,
+    OUT p_branch_id INT
+)
+BEGIN
+    DECLARE v_repo_count INT DEFAULT 0;
+    DECLARE v_user_count INT DEFAULT 0;
+    DECLARE v_member_count INT DEFAULT 0;
+
+    SELECT COUNT(*) INTO v_repo_count
+    FROM `REPOSITORY`
+    WHERE repo_id = p_repo_id;
+
+    SELECT COUNT(*) INTO v_user_count
+    FROM `USER`
+    WHERE user_id = p_created_by_user_id;
+
+    SELECT COUNT(*) INTO v_member_count
+    FROM `REPOSITORY_MEMBER`
+    WHERE repo_id = p_repo_id
+      AND user_id = p_created_by_user_id
+      AND role IN ('Maintainer', 'Contributor');
+
+    IF v_repo_count = 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Repository does not exist';
+    END IF;
+
+    IF v_user_count = 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Branch creator does not exist';
+    END IF;
+
+    IF v_member_count = 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Branch creator must be a Maintainer or Contributor';
+    END IF;
+
+    INSERT INTO `BRANCH`
+        (branch_name, repo_id, created_by_user_id)
+    VALUES
+        (p_branch_name, p_repo_id, p_created_by_user_id);
+
+    SET p_branch_id = LAST_INSERT_ID();
+END$$
+
+-- Record a commit. Pushes remain a separate operation in PUSH_EVENT.
+CREATE PROCEDURE sp_record_commit(
+    IN p_branch_id INT,
+    IN p_author_user_id INT,
+    IN p_tree_id INT,
+    IN p_message TEXT,
+    OUT p_commit_id INT
+)
+BEGIN
+    INSERT INTO `COMMIT`
+        (message, branch_id, author_user_id, tree_id)
+    VALUES
+        (p_message, p_branch_id, p_author_user_id, p_tree_id);
+
+    SET p_commit_id = LAST_INSERT_ID();
+END$$
+
+-- Record a push event separately from the commit operation.
+CREATE PROCEDURE sp_record_push(
+    IN p_branch_id INT,
+    IN p_user_id INT,
+    OUT p_push_id INT
+)
+BEGIN
+    INSERT INTO `PUSH_EVENT`
+        (user_id, branch_id)
+    VALUES
+        (p_user_id, p_branch_id);
+
+    SET p_push_id = LAST_INSERT_ID();
+END$$
+
+DELIMITER ;
+
+-- ================================================================
+-- 19. PROCEDURE EXECUTION
+-- ================================================================
+
+-- Create a new repository using the procedure.
+SET @new_repo_id = NULL;
+CALL sp_create_repository(
+    6,
+    'AnalyticsLab',
+    'Repository created through the stored procedure demonstration.',
+    'Public',
+    @new_repo_id
+);
+
+-- Add user 5 as a contributor for the new repository.
+INSERT INTO `REPOSITORY_MEMBER`
+    (role, user_id, repo_id)
+VALUES
+    ('Contributor', 5, @new_repo_id);
+
+-- Create the main branch through the branch procedure.
+SET @procedure_branch_id = NULL;
+CALL sp_create_branch(
+    @new_repo_id,
+    'main',
+    5,
+    @procedure_branch_id
+);
+
+-- Create a blob object and its BLOBS row.
+INSERT INTO `OBJECT`
+    (object_hash, object_type, repo_id)
+VALUES
+    ('1414141414141414141414141414141414141414141414141414141414141414', 'blob', @new_repo_id);
+
+SET @procedure_blob_id = LAST_INSERT_ID();
+
+INSERT INTO `BLOBS`
+    (blob_id, storage_path, mime_type)
+VALUES
+    (@procedure_blob_id, '/objects/14/analytics.sql', 'application/sql');
+
+-- Create a tree object and its TREE row.
+INSERT INTO `OBJECT`
+    (object_hash, object_type, repo_id)
+VALUES
+    ('1515151515151515151515151515151515151515151515151515151515151515', 'tree', @new_repo_id);
+
+SET @procedure_tree_id = LAST_INSERT_ID();
+
+INSERT INTO `TREE` (tree_id)
+VALUES (@procedure_tree_id);
+
+INSERT INTO `TREE_ENTRY`
+    (file_mode, file_name, tree_id, subtree_id, blob_id)
+VALUES
+    ('100644', 'analytics.sql', @procedure_tree_id, NULL, @procedure_blob_id);
+
+-- Record the commit and push as separate version-control operations.
+SET @procedure_commit_id = NULL;
+CALL sp_record_commit(
+    @procedure_branch_id,
+    5,
+    @procedure_tree_id,
+    'Add analytics SQL module through stored procedure',
+    @procedure_commit_id
+);
+
+SET @procedure_push_id = NULL;
+CALL sp_record_push(
+    @procedure_branch_id,
+    5,
+    @procedure_push_id
+);
+
+-- Verify procedure-created records.
+SELECT
+    r.repo_name,
+    b.branch_name,
+    c.commit_id,
+    c.message,
+    u.username AS author,
+    p.push_id
+FROM `REPOSITORY` r
+JOIN `BRANCH` b ON b.repo_id = r.repo_id
+JOIN `COMMIT` c ON c.branch_id = b.branch_id
+JOIN `USER` u ON u.user_id = c.author_user_id
+LEFT JOIN `PUSH_EVENT` p
+    ON p.branch_id = b.branch_id
+   AND p.user_id = c.author_user_id
+WHERE r.repo_id = @new_repo_id
+ORDER BY c.committed_at;
+
+-- ================================================================
+-- 20. TRIGGER EXECUTION / VERIFICATION
+-- ================================================================
+
+-- Trigger 1 verification:
+-- The owner of AnalyticsLab was automatically inserted as Maintainer.
+SELECT
+    rm.membership_id,
+    u.username,
+    r.repo_name,
+    rm.role
+FROM `REPOSITORY_MEMBER` rm
+JOIN `USER` u ON u.user_id = rm.user_id
+JOIN `REPOSITORY` r ON r.repo_id = rm.repo_id
+WHERE r.repo_id = @new_repo_id
+ORDER BY rm.membership_id;
+
+-- Trigger 2 verification:
+-- The branch insertion succeeded because user 5 is a Contributor in AnalyticsLab.
+SELECT
+    branch_id,
+    branch_name,
+    repo_id,
+    created_by_user_id
+FROM `BRANCH`
+WHERE branch_id = @procedure_branch_id;
+
+-- Trigger 3/4/5 verification:
+-- The commit and push succeeded because the author is a Contributor, the
+-- tree is a valid tree object, and the tree belongs to the same repository.
+SELECT
+    c.commit_id,
+    c.message,
+    c.branch_id,
+    c.author_user_id,
+    c.tree_id,
+    p.push_id,
+    p.user_id,
+    p.branch_id
+FROM `COMMIT` c
+LEFT JOIN `PUSH_EVENT` p
+    ON p.user_id = c.author_user_id
+   AND p.branch_id = c.branch_id
+WHERE c.branch_id = @procedure_branch_id
+ORDER BY c.commit_id DESC;
+
+-- ================================================================
+-- 21. FINAL DATABASE STATE / SUMMARY QUERIES
+-- ================================================================
+
+-- Build the initial Neo4j projection after all seeded repository rows exist.
+INSERT INTO `VCS_GRAPH_OUTBOX` (event_type, payload)
+SELECT 'sync_repository', JSON_OBJECT('repo_id', repo_id)
+FROM `REPOSITORY`;
+
+-- Object catalogue summary by repository and object type.
+SELECT
+    r.repo_name,
+    o.object_type,
+    COUNT(*) AS object_count
+FROM `OBJECT` o
+JOIN `REPOSITORY` r ON r.repo_id = o.repo_id
+GROUP BY r.repo_id, r.repo_name, o.object_type
+ORDER BY r.repo_name, o.object_type;
+
+
+-- Final repository activity summary.
+SELECT *
+FROM `vw_repository_activity`
+ORDER BY commit_count DESC, repo_name;
+
+-- Final row counts for the major tables.
+SELECT 'USER' AS table_name, COUNT(*) AS row_count FROM `USER`
+UNION ALL
+SELECT 'REPOSITORY', COUNT(*) FROM `REPOSITORY`
+UNION ALL
+SELECT 'REPOSITORY_MEMBER', COUNT(*) FROM `REPOSITORY_MEMBER`
+UNION ALL
+SELECT 'BRANCH', COUNT(*) FROM `BRANCH`
+UNION ALL
+SELECT 'OBJECT', COUNT(*) FROM `OBJECT`
+UNION ALL
+SELECT 'TREE', COUNT(*) FROM `TREE`
+UNION ALL
+SELECT 'BLOBS', COUNT(*) FROM `BLOBS`
+UNION ALL
+SELECT 'TREE_ENTRY', COUNT(*) FROM `TREE_ENTRY`
+UNION ALL
+SELECT 'COMMIT', COUNT(*) FROM `COMMIT`
+UNION ALL
+SELECT 'PUSH_EVENT', COUNT(*) FROM `PUSH_EVENT`
+UNION ALL
+SELECT 'VCS_GRAPH_OUTBOX', COUNT(*) FROM `VCS_GRAPH_OUTBOX`
+ORDER BY table_name;
+
+-- ================================================================
+-- END OF FILE
+-- ================================================================
